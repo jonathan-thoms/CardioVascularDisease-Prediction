@@ -3,7 +3,7 @@ from flask import Flask, request, jsonify
 import joblib
 import numpy as np
 import shap
-
+import os
 # Load the trained model
 model = joblib.load("cardio_risk_model_v3.pkl")
 
@@ -64,6 +64,6 @@ def predict():
 
 
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 10000))  # Default to 10000 if PORT is not set
-    app.run(host='0.0.0.0', port=port)
+    port = int(os.environ.get("PORT", 5000))  # Default to 10000 if PORT is not set
+    app.run(host='127.0.0.1', port=port)
 
