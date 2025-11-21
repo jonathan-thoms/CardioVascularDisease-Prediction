@@ -1,161 +1,172 @@
 import pandas as pd
-import datetime
 import numpy as np
-from sklearn.model_selection import train_test_split
+import datetime
+import joblib
+import os
+from typing import Tuple, List
+from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, classification_report, roc_auc_score
-import joblib
 from imblearn.over_sampling import SMOTE
-from sklearn.model_selection import GridSearchCV
 
-# Load Framingham Heart Study dataset
-framingham_data = pd.read_csv("data/framingham.csv")
+# Ensure directories exist
+os.makedirs("model_artifacts", exist_ok=True)
 
-# Load MIMIC-III datasets
-patients = pd.read_csv("data/patients.csv", usecols=["subject_id", "gender", "dob"])
-admissions = pd.read_csv("data/admissions.csv", usecols=["subject_id", "admittime", "diagnosis"])
-labevents = pd.read_csv("data/labevents.csv", usecols=["subject_id", "itemid", "valuenum"])
-chartevents = pd.read_csv("data/chartevents.csv", usecols=["subject_id", "itemid", "valuenum"])
-diagnoses = pd.read_csv("data/diagnoses_icd.csv", usecols=["subject_id", "icd9_code"])
+def process_mimic(patients_path: str, admissions_path: str, lab_path: str, chart_path: str, diag_path: str) -> pd.DataFrame:
+    """
+    Preprocesses MIMIC-III data: merges tables, handles dates, and calculates age.
+    """
+    print("Loading MIMIC-III dataset...")
+    try:
+        # Load raw files (Optimized with specific columns)
+        patients = pd.read_csv(patients_path, usecols=["subject_id", "gender", "dob"])
+        admissions = pd.read_csv(admissions_path, usecols=["subject_id", "admittime"])
+        labevents = pd.read_csv(lab_path, usecols=["subject_id", "itemid", "valuenum"])
+        chartevents = pd.read_csv(chart_path, usecols=["subject_id", "itemid", "valuenum"])
+        diagnoses = pd.read_csv(diag_path, usecols=["subject_id", "icd9_code"])
 
-# Convert gender to numeric
-patients["gender"] = patients["gender"].map({"M": 1, "F": 0})
+        # Standardization
+        patients["gender"] = patients["gender"].map({"M": 1, "F": 0})
 
-# Process lab and chart events (selecting relevant measurements)
-lab_items = {50907: "chol", 50882: "glucose"}
-chart_items = {220045: "trestbps", 220210: "diabp", 220277: "bmi"}
+        # Feature Mapping
+        lab_map = {50907: "chol", 50882: "glucose"}
+        chart_map = {220045: "trestbps", 220210: "diabp", 220277: "bmi"}
 
-labevents = labevents[labevents["itemid"].isin(lab_items.keys())].replace({"itemid": lab_items})
-chartevents = chartevents[chartevents["itemid"].isin(chart_items.keys())].replace({"itemid": chart_items})
+        # Filter and Rename
+        labevents = labevents[labevents["itemid"].isin(lab_map.keys())].replace({"itemid": lab_map})
+        chartevents = chartevents[chartevents["itemid"].isin(chart_map.keys())].replace({"itemid": chart_map})
 
-# Handle duplicate values by averaging per subject_id
-labevents = labevents.groupby(["subject_id", "itemid"])["valuenum"].mean().unstack().reset_index()
-chartevents = chartevents.groupby(["subject_id", "itemid"])["valuenum"].mean().unstack().reset_index()
+        # Aggregate (Mean per patient)
+        lab_agg = labevents.groupby(["subject_id", "itemid"])["valuenum"].mean().unstack().reset_index()
+        chart_agg = chartevents.groupby(["subject_id", "itemid"])["valuenum"].mean().unstack().reset_index()
 
-# Merge MIMIC datasets
-mimic_data = patients.merge(admissions, on="subject_id", how="inner")
-mimic_data = mimic_data.merge(labevents, on="subject_id", how="left")
-mimic_data = mimic_data.merge(chartevents, on="subject_id", how="left")
-mimic_data = mimic_data.merge(diagnoses, on="subject_id", how="left")
+        # Merging
+        df = patients.merge(admissions, on="subject_id", how="inner")
+        df = df.merge(lab_agg, on="subject_id", how="left")
+        df = df.merge(chart_agg, on="subject_id", how="left")
+        df = df.merge(diagnoses, on="subject_id", how="left")
 
-# Convert to datetime, handling future dates by shifting 100 years
-mimic_data["dob"] = pd.to_datetime(mimic_data["dob"], errors="coerce")
-mimic_data["admittime"] = pd.to_datetime(mimic_data["admittime"], errors="coerce")
+        # Date Handling (Shift future dates)
+        for col in ["dob", "admittime"]:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+            current_year = datetime.datetime.now().year
+            df.loc[df[col].dt.year > current_year, col] -= pd.DateOffset(years=100)
 
-current_year = datetime.datetime.now().year
-mimic_data.loc[mimic_data["dob"].dt.year > current_year, "dob"] -= pd.DateOffset(years=100)
-mimic_data.loc[mimic_data["admittime"].dt.year > current_year, "admittime"] -= pd.DateOffset(years=100)
+        # Age Calculation
+        df["age"] = df["admittime"].dt.year - df["dob"].dt.year
+        df.loc[(df["age"] > 110) | (df["age"] < 0), "age"] = np.nan
+        df.dropna(subset=["age"], inplace=True)
 
-# Compute age at admission
-mimic_data["age"] = mimic_data["admittime"].dt.year - mimic_data["dob"].dt.year
-mimic_data.loc[mimic_data["age"] > 110, "age"] = 90
-mimic_data.loc[mimic_data["age"] < 0, "age"] = np.nan
-mimic_data.dropna(subset=["age"], inplace=True)
+        # Target Generation (ICD9 starts with 410 = Heart Attack)
+        df["target"] = df["icd9_code"].apply(lambda x: 1 if str(x).startswith("410") else 0)
 
-# Drop unnecessary columns
-mimic_data.drop(columns=["subject_id", "admittime", "dob"], inplace=True)
+        # Add missing columns common to other datasets
+        for col in ["smoking", "alcohol", "exercise"]:
+            df[col] = 0 
 
-# Define target variable (heart disease risk based on ICD9 codes)
-mimic_data["target"] = mimic_data["icd9_code"].apply(lambda x: 1 if str(x).startswith("410") else 0)
-mimic_data.drop(columns=["icd9_code"], inplace=True)
+        return df[["age", "gender", "trestbps", "diabp", "chol", "bmi", "glucose", "smoking", "alcohol", "exercise", "target"]]
+    
+    except FileNotFoundError as e:
+        print(f"Skipping MIMIC: {e}")
+        return pd.DataFrame()
 
-# Load Cardiovascular Disease Dataset
-cardio_data = pd.read_csv("data/cardio_train.csv", sep=";")
+def process_cardio(path: str) -> pd.DataFrame:
+    print("Loading Cardio Train dataset...")
+    try:
+        df = pd.read_csv(path, sep=";")
+        
+        # BMI Calculation
+        if "bmi" not in df.columns:
+            df["bmi"] = df["weight"] / ((df["height"] / 100) ** 2)
 
-# Check if BMI is missing
-if "bmi" not in cardio_data.columns:
-    # Calculate BMI using weight (kg) and height (cm)
-    cardio_data["bmi"] = cardio_data["weight"] / ((cardio_data["height"] / 100) ** 2)
+        # Renaming
+        rename_map = {
+            "age": "age", "gender": "gender", "ap_hi": "trestbps", 
+            "ap_lo": "diabp", "cholesterol": "chol", "gluc": "glucose", 
+            "smoke": "smoking", "alco": "alcohol", "active": "exercise", 
+            "cardio": "target"
+        }
+        df.rename(columns=rename_map, inplace=True)
 
-# Rename columns to match existing datasets
-cardio_data.rename(columns={
-    "age": "age",
-    "gender": "gender",
-    "ap_hi": "trestbps",
-    "ap_lo": "diabp",
-    "cholesterol": "chol",
-    "gluc": "glucose",
-    "smoke": "smoking",
-    "alco": "alcohol",
-    "active": "exercise",
-    "cardio": "target"
-}, inplace=True)
+        # Normalization
+        df["age"] = df["age"] // 365
+        df["gender"] = df["gender"].map({1: 1, 2: 0}) # Assuming 1=Male
+        
+        return df[list(rename_map.values())]
+    except FileNotFoundError:
+        print("Skipping Cardio Train (File not found)")
+        return pd.DataFrame()
 
-# Convert age from days to years
-cardio_data["age"] = cardio_data["age"] // 365
+def process_framingham(path: str) -> pd.DataFrame:
+    print("Loading Framingham dataset...")
+    try:
+        df = pd.read_csv(path)
+        rename_map = {
+            "male": "gender", "sysBP": "trestbps", "diaBP": "diabp",
+            "totChol": "chol", "BMI": "bmi", "glucose": "glucose", 
+            "TenYearCHD": "target"
+        }
+        df.rename(columns=rename_map, inplace=True)
+        
+        # Add missing cols
+        for col in ["smoking", "alcohol", "exercise"]:
+            df[col] = 0
 
-# Normalize categorical columns (0/1 encoding)
-cardio_data["gender"] = cardio_data["gender"].map({1: 1, 2: 0})
-cardio_data["smoking"] = cardio_data["smoking"].astype(int)
-cardio_data["alcohol"] = cardio_data["alcohol"].astype(int)
-cardio_data["exercise"] = cardio_data["exercise"].astype(int)
+        cols = list(rename_map.values()) + ["smoking", "alcohol", "exercise"]
+        return df[cols]
+    except FileNotFoundError:
+        print("Skipping Framingham (File not found)")
+        return pd.DataFrame()
 
-# Define feature set
-common_features = ["age", "gender", "trestbps", "diabp", "chol", "bmi", "glucose", "smoking", "alcohol", "exercise", "target"]
+def train():
+    # 1. Load and Merge Data
+    df_mimic = process_mimic("data/patients.csv", "data/admissions.csv", "data/labevents.csv", "data/chartevents.csv", "data/diagnoses_icd.csv")
+    df_cardio = process_cardio("data/cardio_train.csv")
+    df_fram = process_framingham("data/framingham.csv")
 
-# Standardize column names for Framingham dataset
-framingham_data.rename(columns={
-    "male": "gender",
-    "sysBP": "trestbps",
-    "diaBP": "diabp",
-    "totChol": "chol",
-    "BMI": "bmi",
-    "glucose": "glucose",
-    "TenYearCHD": "target"
-}, inplace=True)
+    combined_df = pd.concat([df_mimic, df_cardio, df_fram], ignore_index=True)
+    combined_df.dropna(inplace=True)
 
-# Ensure missing columns exist in all datasets
-for col in ["smoking", "alcohol", "exercise"]:
-    if col not in framingham_data:
-        framingham_data[col] = 0  # Default: Non-smoker, No alcohol, No exercise
+    print(f"Total records after merging: {len(combined_df)}")
 
-    if col not in mimic_data:
-        mimic_data[col] = 0  # Default: Non-smoker, No alcohol, No exercise
+    X = combined_df.drop(columns=["target"])
+    y = combined_df["target"]
 
-# Select only relevant columns
-framingham_data = framingham_data[common_features[:-3]]  # Framingham lacks smoking, alcohol, exercise
-mimic_data = mimic_data[common_features[:-3]]  # MIMIC lacks lifestyle factors
-cardio_data = cardio_data[common_features]  # Cardio dataset has all features
+    # 2. Split Data BEFORE SMOTE (Crucial for validity)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-# Merge all datasets
-data = pd.concat([framingham_data, mimic_data, cardio_data], ignore_index=True)
-data.dropna(inplace=True)
+    # 3. Apply SMOTE only to Training Data
+    print("Applying SMOTE to training set...")
+    smote = SMOTE(random_state=42)
+    X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
 
-# Define features and target
-X = data.drop(columns=["target"])
-y = data["target"]
+    # 4. Hyperparameter Tuning
+    print("Tuning Hyperparameters...")
+    param_grid = {
+        "n_estimators": [100, 200],
+        "max_depth": [10, 20, None],
+        "min_samples_split": [2, 5],
+    }
+    
+    grid = GridSearchCV(RandomForestClassifier(random_state=42), param_grid, cv=3, scoring="roc_auc", n_jobs=-1)
+    grid.fit(X_train_res, y_train_res)
 
-# Apply SMOTE to balance dataset
-smote = SMOTE(random_state=42)
-X_resampled, y_resampled = smote.fit_resample(X, y)
+    best_model = grid.best_estimator_
 
-# Split data **AFTER SMOTE**
-X_train, X_test, y_train, y_test = train_test_split(X_resampled, y_resampled, test_size=0.2, random_state=42)
+    # 5. Evaluation
+    y_pred = best_model.predict(X_test)
+    print(f"Best Params: {grid.best_params_}")
+    print(f"Accuracy: {accuracy_score(y_test, y_pred):.4f}")
+    print(f"AUC-ROC: {roc_auc_score(y_test, y_pred):.4f}")
 
-# Define hyperparameter grid
-param_grid = {
-    "n_estimators": [100, 200, 300],
-    "max_depth": [None, 10, 20],
-    "min_samples_split": [2, 5, 10],
-}
+    # 6. Save Model & Feature Names
+    # Saving columns is important to ensure API inputs match Model inputs order
+    model_data = {
+        "model": best_model,
+        "features": list(X.columns)
+    }
+    joblib.dump(model_data, "model_artifacts/cardio_risk_model_v3.pkl")
+    print("Model saved successfully.")
 
-# Perform Grid Search with 5-fold Cross Validation
-grid_search = GridSearchCV(RandomForestClassifier(random_state=42), param_grid, cv=5, scoring="roc_auc", n_jobs=-1)
-grid_search.fit(X_train, y_train)
-
-# Get the best model
-best_model = grid_search.best_estimator_
-
-# Train the best model
-best_model.fit(X_train, y_train)
-
-# Evaluate model
-y_pred = best_model.predict(X_test)
-print("Best Parameters:", grid_search.best_params_)
-print("Accuracy:", accuracy_score(y_test, y_pred))
-print("AUC-ROC:", roc_auc_score(y_test, y_pred))
-print(classification_report(y_test, y_pred))
-
-# Save best model
-joblib.dump(best_model, "cardio_risk_model_v3.pkl")
-print("Optimized Model saved as cardio_risk_model_v3.pkl")
+if __name__ == "__main__":
+    train()
