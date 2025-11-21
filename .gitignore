@@ -1,0 +1,13 @@
+# Python garbage
+__pycache__/
+*.pyc
+
+# Virtual Environments
+venv/
+env/
+
+# Secrets
+.env
+
+# Model artifacts (Optional: keep this commented out if you WANT to push the .pkl file for the demo)
+# model_artifacts/
