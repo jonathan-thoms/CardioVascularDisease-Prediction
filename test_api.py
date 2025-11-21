@@ -1,27 +1,55 @@
-import requests
+import unittest
+import json
+from app import app
 
-# API URL
-url = "http://127.0.0.1:5000/predict"
+class TestCardioAPI(unittest.TestCase):
+    
+    def setUp(self):
+        self.app = app.test_client()
+        self.app.testing = True
 
-# JSON data (patient details)
-data = {
-    "age": 68,
-    "sex": 1,
-    "cp": 1,
-    "trestbps": 160,
-    "chol": 290,
-    "fbs": 1,
-    "restecg": 2,
-    "thalach": 120,
-    "exang": 1,
-    "oldpeak": 2.5,
-    "slope": 1,
-    "ca": 3,
-    "thal": 3
-}
+    def test_health_check(self):
+        response = self.app.get('/health')
+        self.assertEqual(response.status_code, 200)
 
-# Send POST request
-response = requests.post(url, json=data)
+    def test_prediction_valid_data(self):
+        payload = {
+            "age": 55,
+            "sex": 1,
+            "trestbps": 140,
+            "diabp": 90,
+            "chol": 240,
+            "bmi": 28.5,
+            "glucose": 100,
+            "smoking": 0,
+            "alcohol": 1,
+            "exercise": 0
+        }
+        response = self.app.post('/predict', 
+                                 data=json.dumps(payload), 
+                                 content_type='application/json')
+        
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertIn("prediction", data)
+        self.assertIn("risk_probability", data)
+        self.assertIsInstance(data["key_risk_factors"], list)
 
-# Print the response
-print(response.json())
+    def test_validation_error(self):
+        # Sending "age": "old" should trigger error
+        payload = {
+            "age": "old", 
+            "sex": 1,
+            "trestbps": 140, "diabp": 90, "chol": 240,
+            "bmi": 28.5, "glucose": 100, "smoking": 0,
+            "alcohol": 1, "exercise": 0
+        }
+        response = self.app.post('/predict', 
+                                 data=json.dumps(payload), 
+                                 content_type='application/json')
+        
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Validation Failed", response.get_json()["error"])
+
+if __name__ == "__main__":
+    unittest.main()
