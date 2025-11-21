@@ -55,3 +55,32 @@ A robust Machine Learning API that predicts heart disease risk by synthesizing d
 Run the automated test suite to verify API health and validation logic:
 ```bash
 python test_api.py
+
+📡 API Usage
+Endpoint: POST /predict
+
+Payload:
+
+JSON
+
+{
+    "age": 55,
+    "sex": 1,
+    "trestbps": 145,
+    "diabp": 90,
+    "chol": 260,
+    "bmi": 30.2,
+    "glucose": 110,
+    "smoking": 1,
+    "alcohol": 0,
+    "exercise": 1
+}
+Response:
+
+JSON
+
+{
+    "prediction": "High Risk",
+    "risk_probability": 0.78,
+    "key_risk_factors": ["chol", "trestbps", "smoking"]
+}
